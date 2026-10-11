@@ -208,13 +208,19 @@ class RPCClient:
             await connection.send_frame(self._codec.encode_envelope(envelope))
             return await asyncio.wait_for(future, timeout=timeout_ms / 1000.0)
         except asyncio.TimeoutError:
-            self._pending_requests.pop(request_id, None)
             raise RPCError(ErrorCode.E_TIMEOUT, f"请求 {method} 超时 ({timeout_ms}ms)") from None
         except Exception as exc:
-            self._pending_requests.pop(request_id, None)
             if isinstance(exc, RPCError):
                 raise
             raise RPCError(ErrorCode.E_UNKNOWN, str(exc)) from exc
+        finally:
+            # CancelledError 不属于 Exception，取消发送或等待时也必须回收请求。
+            self._pending_requests.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                # 发送期间断线可能先设置异常，避免该 Future 无人读取。
+                future.exception()
 
     async def send_event(
         self,
@@ -245,6 +251,23 @@ class RPCClient:
 
     async def _recv_loop(self) -> None:
         """持续接收 Host 发来的消息并分发。"""
+        try:
+            await self._receive_messages()
+        finally:
+            # 接收结束后不再有响应来源：先撤销连接并唤醒所有请求，再关闭传输。
+            # 不调用 disconnect()，避免接收任务取消并等待自身。
+            self._running = False
+            connection = self._connection
+            self._connection = None
+            for future in self._pending_requests.values():
+                if not future.done():
+                    future.set_exception(RPCError(ErrorCode.E_UNKNOWN, "Host 连接已断开"))
+            self._pending_requests.clear()
+            if connection is not None:
+                await connection.close()
+
+    async def _receive_messages(self) -> None:
+        """读取并分发消息；连接退出清理由接收循环统一负责。"""
         while self._running and self._connection is not None and not self._connection.is_closed:
             try:
                 data = await self._connection.recv_frame()
